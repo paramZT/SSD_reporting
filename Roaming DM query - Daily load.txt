@@ -1,0 +1,32 @@
+Insert into Table roaming_dashboard_data
+SELECT MSISDN,
+       event_type_id,
+       Country,
+       Operator,
+       roam_call_type,
+       call_type,
+       Usage,
+       revenue,
+       date_id
+       FROM (
+SELECT 
+      msisdn MSISDN,
+      event_type_id AS event_type_id ,
+      roamed_country as Country,
+      ro.plmnname as Operator,
+      frud.roam_call_type roam_call_type,
+      call_type,
+      Round(SUM(CASE
+          WHEN frud.event_type_id = 1 AND frud.call_type = 'MOC' THEN frud.moc_rounded_usage/60
+          WHEN frud.event_type_id = 1 AND frud.call_type = 'MTC' THEN frud.mtc_rounded_usage/60
+          WHEN frud.event_type_id = 2 THEN call_count
+          WHEN frud.event_type_id = 3 THEN data_actual_usage
+      END),2) as Usage,
+      SUM(frud.ssp_commission_amount) as revenue,
+      cast(to_timestamp(cast (date_id as string), 'yyyyMMdd')as date) as date_id
+FROM reporting.fact_roaming_usage_dtl as frud
+LEFT JOIN dim.dim_roam_operator as ro
+on frud.roam_operator_id = ro.roam_operator_id
+GROUP BY msisdn, event_type_id, country, operator, roam_call_type, call_type, date_id
+) X
+WHERE X.date_id > (SELECT max(date_id) from roaming_dashboard_data)
