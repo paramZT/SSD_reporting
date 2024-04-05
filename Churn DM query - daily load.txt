@@ -1,0 +1,143 @@
+
+with fil_data as (
+select msisdn
+		, dola
+		, dola_voice
+		, dola_data
+		, dola_subscription
+		, dola_me2u
+    , CAST(CONCAT(SUBSTRING(CAST(date_id AS STRING), 1, 4), '-'
+                      , SUBSTRING(CAST(date_id AS STRING), 5, 2), '-'
+                      , SUBSTRING(CAST(date_id AS STRING), 7, 2))
+                AS DATE) AS converted_date
+    , COALESCE(home_cell_id, work_cell_id) loc
+from reporting.fact_cummulative_subscriber_usage
+where not(dola is null and dola_voice is null and dola_sms is null and dola_data is null and dola_subscription is null
+					   and dola_me2u is null) and (floor(msisdn/1000000000))=211 
+					   and CAST(CONCAT(SUBSTRING(CAST(date_id AS STRING), 1, 4), '-'
+							  , SUBSTRING(CAST(date_id AS STRING), 5, 2), '-'
+							  , SUBSTRING(CAST(date_id AS STRING), 7, 2))
+								AS DATE) > select MAX(churn_date) from reporting.churn_dashboard_data 
+) 
+, date_diff_Cte as(
+Select *
+      , DATEDIFF(csu.converted_date, dola) dola_diff
+      , DATEDIFF(csu.converted_date, dola_voice) dola_voice_diff
+      , DATEDIFF(csu.converted_date, dola_data) dola_data_diff
+      , DATEDIFF(csu.converted_date, dola_subscription) dola_subscription_diff
+      , DATEDIFF(csu.converted_date, dola_me2u) dola_me2u_diff
+from fil_data csu
+WHERE  DATEDIFF(CSU.CONVERTED_DATE, DOLA)=90 OR DATEDIFF(CSU.CONVERTED_DATE, DOLA_VOICE)=90
+          OR  DATEDIFF(CSU.CONVERTED_DATE, DOLA_DATA)=90
+          OR DATEDIFF(csu.converted_date, dola_subscription)=90 or DATEDIFF(csu.converted_date, dola_me2u)=90
+) --select * from date_diff_Cte
+, usage_calc as (
+select msisdn
+  		, 'Total' as usage_type
+  		, 0 as usage_type_id
+  		, dola as dola_date
+  		, converted_date as churn_date
+		, loc
+from date_diff_Cte
+where dola_diff = 90
+union
+select msisdn
+  		, 'Voice' as usage_type
+  		, 1 as usage_type_id
+  		, dola_voice as dola_date
+  		, converted_date as churn_date
+  		, loc
+from date_diff_Cte
+where dola_voice_diff = 90
+union
+select msisdn
+  		, 'Data' as usage_type
+  		, 3 as usage_type_id
+  		, dola_data as dola_date
+  		, converted_date as churn_date
+  		, loc
+from date_diff_Cte
+where dola_data_diff = 90
+UNION
+select msisdn
+  		, 'VAS' as usage_type
+  		, 6 as usage_type_id
+  		, dola_subscription as dola_date
+  		, converted_date as churn_date
+		, loc
+from date_diff_Cte
+where dola_subscription_diff = 90
+union
+select msisdn
+  		, 'ME2U' as usage_type
+  		, 8 as usage_type_id
+  		, dola_me2u as dola_date
+  		, converted_date as churn_date
+		, loc
+from date_diff_Cte
+where dola_me2u_diff = 90
+) 
+, final_calc_cte as (
+select  csu.msisdn	
+		, csu.usage_type
+		, csu.usage_type_id
+		, csu.dola_date
+  	, case when lower(up.paytype) = 'prepaid' then csu.churn_date
+  	       when term_outer.msisdn is not null then CAST(CONCAT(SUBSTRING(CAST(term_outer.date_id AS STRING), 1, 4), '-'
+                                                              , SUBSTRING(CAST(term_outer.date_id AS STRING), 5, 2), '-'
+                                                              , SUBSTRING(CAST(term_outer.date_id AS STRING), 7, 2))
+                                                        AS DATE)
+  	  end churn_date
+		, bs.state as loc
+		, up.paytype as service_class
+		, datediff(csu.dola_date, up.account_active_from) AS tenure
+from usage_calc csu
+LEFT JOIN (select msisdn, account_active_from, lkp.paytype
+		  from fnd.fnd_dim_subscriber_profile sub
+		  left join dim.lkp_service_class lkp on lkp.service_class_id = sub.service_class_id
+		  group by msisdn, account_active_from, lkp.paytype
+) up on csu.msisdn = (211000000000+ up.msisdn)
+LEFT JOIN dim.dim_base_station bs ON csu.loc = bs.locno
+left join ( select  msisdn, is_lcs_terminated, date_id
+            from(
+                select msisdn, is_lcs_terminated, date_id, row_number()over(partition by msisdn order by date_id) rn
+                from reporting.dim_subscriber_profile
+                where is_lcs_terminated = 1 and lower(subscription_type) = 'postpaid'
+            ) term 
+            where rn = 1
+) term_outer on term_outer.msisdn = csu.msisdn 
+)
+, arpu_cte as
+(
+select main.msisdn, main.usage_type, main.dola_date
+  		, main.churn_date, main.service_class, main.tenure, main.loc
+      ,  sum(net_amount) as ARPU
+from final_calc_cte main
+left join (select  msisdn
+                  , CAST(CONCAT(SUBSTRING(CAST(date_id AS STRING), 1, 4), '-'
+                                , SUBSTRING(CAST(date_id AS STRING), 5, 2), '-'
+                                , SUBSTRING(CAST(date_id AS STRING), 7, 2))
+                        AS DATE) as dateid
+                  , net_amount
+                  , event_type_id
+                  , service_type_id
+          from reporting.fact_daily_usage_dtl
+)dtl on  main.msisdn = dtl.msisdn
+        and CASE  WHEN main.usage_type_id = 0 then 0
+                  ELSE main.usage_type_id
+            END = CASE WHEN main.usage_type_id = 0 then 0
+                       WHEN main.usage_type_id in (6,8) then dtl.service_type_id
+                       ELSE dtl.event_type_id
+                  END
+        and datediff(main.dola_date, dateid)>=0
+        and datediff(main.dola_date, dateid) <= case when lower(main.service_class) = 'prepaid' then 90
+                                                 when lower(main.service_class) = 'postpaid' then 30
+                                                 else 90
+                                            end
+group by main.msisdn, main.usage_type, main.churn_date, main.dola_date, main.service_class, main.tenure, main.loc
+)
+
+
+INSERT INTO table reporting.churn_dashboard_data 
+select * from arpu_cte 
+
